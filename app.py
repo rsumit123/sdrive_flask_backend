@@ -232,6 +232,60 @@ def download_file(current_user, file_id):
 
 
 
+@app.route('/api/files/<file_id>/download_presigned_url/', methods=['GET'])
+@token_required
+def download_presigned_url(current_user, file_id):
+    logger.debug(f"Generating presigned URL for file {file_id} for user {current_user['email']}")
+
+    # Check if the file exists and belongs to the current user
+    file_record = db.files.find_one({"id": file_id, "user": str(current_user['_id'])})
+    if not file_record:
+        return jsonify({'error': 'File not found'}), 404
+
+    s3 = boto3.client('s3',
+                      aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
+                      aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
+                      region_name=os.getenv('AWS_APP_S3_REGION_NAME'))
+
+    try:
+        # Check the storage class
+        head_response = s3.head_object(Bucket=os.getenv('AWS_APP_STORAGE_BUCKET_NAME'), Key=file_record['s3_key'])
+        storage_class = head_response.get('StorageClass', 'STANDARD')
+        logger.debug(f"Storage class: {storage_class}")
+
+        if storage_class in ['GLACIER', 'DEEP_ARCHIVE']:
+            # Check if the object is already being restored
+            restore_status = head_response.get('Restore', '')
+            if 'ongoing-request="true"' in restore_status or 'x-amz-restore' in head_response and 'ongoing-request="true"' in head_response['x-amz-restore']:
+                return jsonify({'message': 'File is being restored. Try again later.'}), 202
+
+            # Initiate restoration
+            s3.restore_object(
+                Bucket=os.getenv('AWS_APP_STORAGE_BUCKET_NAME'),
+                Key=file_record['s3_key'],
+                RestoreRequest={'Days': 1, 'GlacierJobParameters': {'Tier': 'Standard'}}
+            )
+            logger.debug("Restore request initiated.")
+            return jsonify({'message': 'File is being restored. Try again later.'}), 202
+
+        # Generate a presigned URL
+        presigned_url = s3.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': os.getenv('AWS_APP_STORAGE_BUCKET_NAME'),
+                'Key': file_record['s3_key']
+            },
+            ExpiresIn=3600  # URL expires in 1 hour
+        )
+
+        logger.debug(f"Presigned URL generated: {presigned_url}")
+
+        return jsonify({'presigned_url': presigned_url, 'file_name': file_record['file_name']}), 200
+
+    except Exception as e:
+        logger.exception(f"Error generating presigned URL: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/files/<file_id>/refresh', methods=['GET'])
 @token_required
 def refresh_file_metadata(current_user, file_id):
