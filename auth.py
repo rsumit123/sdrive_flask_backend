@@ -32,16 +32,16 @@ def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
-        logger.debug(request)
+        # logger.debug(request)
 
-        logger.debug(request.headers)
+        # logger.debug(request.headers)
         
         # Check for token in headers
         if 'x-access-token' in request.headers:
             token = request.headers['x-access-token']
         elif 'Authorization' in request.headers:
             token = request.headers['Authorization'].split()[1]
-            logger.debug("Received token successfully from Authorization header")
+            # logger.debug("Received token successfully from Authorization header")
         else:
             return jsonify({'error': 'Token is missing!'}), 403
         
@@ -51,11 +51,11 @@ def token_required(f):
 
         try:
             # Decode the token and get the user's email
-            logger.debug(f"validating data with token and secret key {token} {secret_key}")
+            # logger.debug(f"validating data with token and secret key {token} {secret_key}")
             data = jwt.decode(token, secret_key, algorithms=['HS256'])
-            logger.debug(f"Decoded token: {data}")
+            # logger.debug(f"Decoded token: {data}")
             current_user = db.users.find_one({'email': data['email']})
-            logger.debug(f"Current user: {current_user}")
+            # logger.debug(f"Current user: {current_user}")
             if not current_user:
                 return jsonify({'error': 'Invalid token!'}), 403
         except Exception as e:

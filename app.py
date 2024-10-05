@@ -42,6 +42,8 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 mongo_handler.setFormatter(formatter)
 logger.addHandler(mongo_handler)
 
+MAX_FILE_SIZE = 1024 * 1024 * 400  # 400MB
+
 # Handle the OPTIONS request manually to avoid 404 errors
 @app.before_request
 def handle_options_request():
@@ -100,17 +102,17 @@ def login():
     email = request.json.get('email')
     password = request.json.get('password')
 
-    logger.debug(f"Received Login attempt for {email}")
+    # logger.debug(f"Received Login attempt for {email}")
 
     if not email or not password:
         return jsonify({"error": "Missing email or password"}), 400
 
-    logger.debug(f"=== Trying to find {email}====")
+    # logger.debug(f"=== Trying to find {email}====")
 
     # Find user by email
     user = db.users.find_one({"email": email})
 
-    logger.debug(f"=== Checking password===")
+    # logger.debug(f"=== Checking password===")
 
     # Check if user exists and if the password matches
     if user and bcrypt.checkpw(password.encode('utf-8'), user['password']):
@@ -133,7 +135,7 @@ def list_files(current_user):
         logger.debug(f"Listing files for {current_user['email']}")
         # Setup S3 client
         logger.debug(f"Setting up S3 client")
-        logger.debug(f"App Access key: {os.getenv('AWS_APP_ACCESS_KEY_ID')}")
+        # logger.debug(f"App Access key: {os.getenv('AWS_APP_ACCESS_KEY_ID')}")
         s3 = boto3.client('s3',
                         aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
                         aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
@@ -199,12 +201,23 @@ def download_file(current_user, file_id):
         if storage_class in ['GLACIER', 'DEEP_ARCHIVE']:
             # print("head response => ", head_response)
             if 'Restore' not in head_response or 'ongoing-request="true"' in head_response['Restore'] or 'ongoing-request="true"' in head_response['x-amz-restore']:
-                s3.restore_object(
-                    Bucket=os.getenv('AWS_APP_STORAGE_BUCKET_NAME'),
-                    Key=file_record['s3_key'],
-                    RestoreRequest={'Days': 1, 'GlacierJobParameters': {'Tier': 'Standard'}}
-                )
-                return jsonify({'message': 'File is being restored. Try again later.'}), 202
+                try:
+                    s3_response = s3.restore_object(
+                        Bucket=os.getenv('AWS_APP_STORAGE_BUCKET_NAME'),
+                        Key=file_record['s3_key'],
+                        RestoreRequest={'Days': 1, 'GlacierJobParameters': {'Tier': 'Standard'}}
+                    )
+                    logger.debug("s3_response while downloading=> ", s3_response)
+                    # db.files.update_one({"id": file_id}, {"$set": {"metadata.tier": "unarchiving"}})
+
+                    return jsonify({'message': 'File is being restored. Try again later.'}), 202
+    
+                except Exception as e:
+                    if 'RestoreAlreadyInProgress' in str(e):
+                        return jsonify({'message': 'File is being restored. Try again later.'}), 203
+                    logger.exception(f"Error restoring file: {str(e)}")
+                    return jsonify({'error': str(e)}), 500
+                    
     
         logger.debug(f"Getting file from S3 to return")
         file_obj = s3.get_object(Bucket=os.getenv('AWS_APP_STORAGE_BUCKET_NAME'), Key=file_record['s3_key'])
@@ -242,7 +255,7 @@ def refresh_file_metadata(current_user, file_id):
         elif storage_class in ['GLACIER', 'DEEP_ARCHIVE']:
             file_record['metadata']['tier'] = 'glacier' if 'Restore' not in head_response else 'unarchiving'
 
-        db.files.update_one({"_id": file_id}, {"$set": {"metadata": file_record['metadata']}})
+        db.files.update_one({"id": file_id}, {"$set": {"metadata": file_record['metadata']}})
 
         return jsonify({'message': 'Metadata refreshed', 'metadata': file_record['metadata']}), 200
 
@@ -257,83 +270,112 @@ def generate_simple_url(s3_key):
     simple_url = requests.get(f"https://ks0bm06q4a.execute-api.us-west-2.amazonaws.com/dev?long_url={s3_url}").json()
     return "https://simple-url.skdev.one/"+simple_url['short_url']
 
-
-
-
 @app.route('/api/files/upload/', methods=['POST'])
 @token_required
 def upload_file(current_user):
     try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file part in the request'}), 400
+        logger.debug("Generating presigned URL for file upload")
 
-        file_obj = request.files['file']
-        tier = request.form.get('tier', 'standard')
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        tier = data.get('tier', 'standard')
+        file_name = data.get('file_name')
+        content_type = data.get('content_type')
+        file_size = data.get('file_size')
+
+        if file_size > MAX_FILE_SIZE:
+            logger.debug(f"File size exceeds the limit of 400MB")
+            return jsonify({'error': 'File size exceeds the limit of 400MB'}), 400
+
+        if not file_name or not content_type:
+            return jsonify({'error': 'file_name and content_type are required'}), 400
 
         # Ensure filename is secure
-        filename = secure_filename(file_obj.filename)
+        filename = secure_filename(file_name)
 
-        # Generate username from email (similar to your logic)
-        username = current_user['email'].split('@')[0] + "-" + current_user['email'].split('@')[1].split('.')[0]
+        # Generate username from email
+        email_parts = current_user['email'].split('@')
+        username = f"{email_parts[0]}-{email_parts[1].split('.')[0]}"
 
         # Generate S3 key
         s3_key = f"{username}/{filename}"
 
-        # Setup S3 client
-        s3 = boto3.client('s3',
-                        aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
-                        aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
-                        region_name=os.getenv('AWS_APP_S3_REGION_NAME'))
+        logger.debug(f"Generating presigned URL for {filename} (Tier: {tier})")
 
-        try:
-            # Upload the file to S3
-            s3.upload_fileobj(
-                file_obj,
-                os.getenv('AWS_APP_STORAGE_BUCKET_NAME'),
-                s3_key,
-                ExtraArgs={'StorageClass': 'GLACIER' if tier == 'glacier' else 'STANDARD'}
-            )
-        except Exception as e:
-            logger.exception(f"Error uploading file to S3: {str(e)}")
-            return jsonify({'error': str(e)}), 500
+        # Initialize S3 client
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_APP_S3_REGION_NAME')
+        )
 
-        # Store file metadata
-        file_metadata = {
-            'content_type': file_obj.mimetype,
-            'size': file_obj.content_length,
-            'tier': tier
-        }
+        # Generate presigned URL
+        presigned_url = s3.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': os.getenv('AWS_APP_STORAGE_BUCKET_NAME'),
+                'Key': s3_key,
+                'ContentType': content_type,
+                'StorageClass': 'GLACIER' if tier == 'glacier' else 'STANDARD',
+            },
+            ExpiresIn=3600  # URL valid for 1 hour
+        )
 
-        # Generate a simple URL for the file
-        simple_url = generate_simple_url(s3_key)
+        # Store file metadata with upload_pending flag
+        store_file_metadata(current_user, filename, s3_key, content_type, tier, upload_complete=False)
 
-        # print("simple_url => ", simple_url)
-        # print("current_user => ", str(current_user['_id']))
-
-        id = simple_url.split("/")[-1]
-
-        # Insert the uploaded file record into MongoDB
-        uploaded_file = {
-            'file_name': filename,
-            'user': str(current_user['_id']),
-            's3_key': s3_key,
-            'metadata': file_metadata,
-            'simple_url': simple_url,
-            'upload_complete': 'complete',
-            'id': id
-        }
-
-        # Insert into the database (MongoDB)
-        db.files.insert_one(uploaded_file)
-
-        # print("uploaded_file => ", uploaded_file)
-
-        return jsonify({'message': 'File uploaded successfully', 'file': {"filename": filename, "s3_key": s3_key, tier: tier   }}), 201
+        return jsonify({
+            'message': 'Use the provided URL to upload directly to S3.',
+            'presigned_url': presigned_url,
+            's3_key': s3_key
+        }), 200
 
     except Exception as e:
-        logger.exception(f"Error uploading file: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-    
+        logger.exception(f"Error generating presigned URL: {str(e)}")
+        return jsonify({'error': 'Failed to generate presigned URL.'}), 500
+
+def store_file_metadata(current_user, filename, s3_key, content_type, tier, upload_complete=True):
+    # Implement your metadata storage logic here (e.g., MongoDB)
+    file_metadata = {
+        'file_name': filename,
+        'user': str(current_user['_id']),
+        's3_key': s3_key,
+        'metadata': {
+            'content_type': content_type,
+            'tier': tier
+        },
+        'upload_complete': 'complete' if upload_complete else 'pending',
+        "id": s3_key.replace("/", "-")
+        # Add other necessary fields as required
+    }
+
+    # Insert into the database (MongoDB)
+    db.files.insert_one(file_metadata)
+
+@app.route('/api/files/confirm_upload/', methods=['POST'])
+@token_required
+def confirm_upload(current_user):
+    data = request.get_json()
+    s3_key = data.get('s3_key')
+
+    if not s3_key:
+        return jsonify({'error': 's3_key is required'}), 400
+
+    # Update the file metadata to mark upload as complete
+    result = db.files.update_one(
+        {'s3_key': s3_key, 'user': str(current_user['_id'])},
+        {'$set': {'upload_complete': 'complete'}}
+    )
+
+    if result.matched_count == 0:
+        return jsonify({'error': 'File not found'}), 404
+
+    return jsonify({'message': 'Upload confirmed successfully'}), 200
+
+
 
 @app.route('/api/files/presign/', methods=['GET'])
 @token_required
@@ -380,7 +422,8 @@ def generate_presigned_url(current_user):
         'metadata': file_metadata,
         'simple_url': '',  # Placeholder for now
         'upload_complete': 'pending',  # Track the completion status
-        'created_at': datetime.datetime.utcnow()
+        'created_at': datetime.datetime.utcnow(),
+        "id": s3_key.replace("/", "-")
     }
 
     # Insert the temporary record in the files collection
@@ -390,7 +433,7 @@ def generate_presigned_url(current_user):
     return jsonify({
         "presigned_url": presigned_url,
         "file_name": s3_key,
-        "temp_id": str(temp_file_id)
+        "id": s3_key.replace("/", "-")
     }), 200
 
 @app.route('/api/logs/', methods=['GET'])
@@ -414,6 +457,59 @@ def get_logs():
     except Exception as e:
         logger.error(f"Error fetching logs: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route('/api/files/<file_id>/', methods=['DELETE'])
+@token_required
+def delete_file(current_user, file_id):
+    try:
+        logger.debug(f"Attempting to delete file with ID: {file_id} for user: {current_user['email']}")
+
+
+        # Fetch the file document from MongoDB
+        file_doc = db.files.find_one({'id': file_id, 'user': str(current_user['_id'])})
+
+        if not file_doc:
+            return jsonify({'error': 'File not found or unauthorized.'}), 404
+
+        s3_key = file_doc.get('s3_key')
+
+        if not s3_key:
+            return jsonify({'error': 'Invalid file metadata.'}), 400
+
+        # Initialize S3 client
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_APP_S3_REGION_NAME')
+        )
+
+        # Delete the file from S3
+        try:
+            s3.delete_object(Bucket=os.getenv('AWS_APP_STORAGE_BUCKET_NAME'), Key=s3_key)
+            logger.debug(f"Deleted file from S3: {s3_key}")
+        except Exception as e:
+            logger.exception(f"Error deleting file from S3: {str(e)}")
+            return jsonify({'error': 'Failed to delete file from storage.'}), 500
+
+        # Delete the file metadata from MongoDB
+        try:
+            result = db.files.delete_one({'id': file_id, 'user': str(current_user['_id'])})
+            if result.deleted_count == 0:
+                logger.error(f"File metadata not found for ID: {file_id}")
+                return jsonify({'error': 'File metadata not found.'}), 404
+            logger.debug(f"Deleted file metadata from MongoDB for ID: {file_id}")
+        except Exception as e:
+            logger.exception(f"Error deleting file metadata from MongoDB: {str(e)}")
+            return jsonify({'error': 'Failed to delete file metadata.'}), 500
+
+        return jsonify({'message': 'File deleted successfully.'}), 200
+
+    except Exception as e:
+        logger.exception(f"Unexpected error during file deletion: {str(e)}")
+        return jsonify({'error': 'An unexpected error occurred.'}), 500
+
 
 
 if __name__ == '__main__':
