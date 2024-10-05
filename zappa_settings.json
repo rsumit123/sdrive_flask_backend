@@ -1,0 +1,17 @@
+{
+    "dev": {
+        "app_function": "app.app",
+        "aws_region": "us-east-1",
+        "exclude": [
+            "boto3",
+            "dateutil",
+            "botocore",
+            "s3transfer",
+            "concurrent"
+        ],
+        "profile_name": "default",
+        "project_name": "sdrive-flask-ba",
+        "runtime": "python3.9",
+        "s3_bucket": "zappa-sdrive-flask"
+    }
+}
