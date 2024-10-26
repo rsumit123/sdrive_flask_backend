@@ -132,6 +132,7 @@ def login():
 @token_required
 def list_files(current_user):
     try:
+    
         logger.debug(f"Listing files for {current_user['email']}")
         # Setup S3 client
         logger.debug(f"Setting up S3 client")
@@ -150,6 +151,7 @@ def list_files(current_user):
         for item in response.get('Contents', []):
             if 'Key' not in item:
                 continue
+            print(item)
             file_key = item['Key']
             file_record = db.files.find_one({"s3_key": file_key, "upload_complete": "complete"})
             if not file_record:
@@ -158,6 +160,7 @@ def list_files(current_user):
                 'simple_url': get_bucket_url() + file_key,
                 'metadata': {"tier": item['StorageClass'].lower(), "size": item['Size']},
                 'upload_complete': 'complete',
+                "last_modified": item['LastModified'],
                 'id': file_key
                 })
             else:
@@ -166,13 +169,16 @@ def list_files(current_user):
                     'simple_url': get_bucket_url() + file_key,
                     'metadata': file_record['metadata'],
                     'upload_complete': file_record['upload_complete'],
-                    'id': file_record['id']
+                    'id': file_record['id'],
+                    "last_modified": item['LastModified']
                 })
+        files = sorted(files, key=lambda x: x['last_modified'], reverse=True)
+            
         
         return jsonify(files), 200
-
     except Exception as e:
         logger.exception(f"Error listing files: {str(e)}")
+        print("Error listing files: ", str(e))
         return jsonify({"error": str(e)}), 500
     
 
