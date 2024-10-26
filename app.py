@@ -151,34 +151,36 @@ def list_files(current_user):
         for item in response.get('Contents', []):
             if 'Key' not in item:
                 continue
-            print(item)
+            # print(item)
             file_key = item['Key']
             file_record = db.files.find_one({"s3_key": file_key, "upload_complete": "complete"})
-            if not file_record:
-                files.append({
-                'file_name': file_key.split("/")[-1],
-                'simple_url': get_bucket_url() + file_key,
-                'metadata': {"tier": item['StorageClass'].lower(), "size": item['Size']},
-                'upload_complete': 'complete',
-                "last_modified": item['LastModified'],
-                'id': file_key
-                })
-            else:
-                files.append({
-                    'file_name': file_record['file_name'],
-                    'simple_url': get_bucket_url() + file_key,
-                    'metadata': file_record['metadata'],
-                    'upload_complete': file_record['upload_complete'],
-                    'id': file_record['id'],
-                    "last_modified": item['LastModified']
-                })
+            
+            files.append({
+            'file_name': file_key.split("/")[-1],
+            'simple_url': get_bucket_url() + file_key,
+            'metadata': {"tier": item['StorageClass'].lower(), "size": item['Size']},
+            'upload_complete': 'complete',
+            "last_modified": item['LastModified'],
+            'id': file_key,
+            "s3_key": file_key
+            })
+            # else:
+            #     files.append({
+            #         'file_name': file_key.split("/")[-1],
+            #         'simple_url': get_bucket_url() + file_key,
+            #         'metadata': {"tier": item['StorageClass'].lower(), "size": item['Size']},
+            #         'upload_complete': file_record['upload_complete'],
+            #         'id': 'complete',
+            #         "last_modified": item['LastModified'],
+            #         "s3_key": file_key
+            #     })
         files = sorted(files, key=lambda x: x['last_modified'], reverse=True)
             
         
         return jsonify(files), 200
     except Exception as e:
         logger.exception(f"Error listing files: {str(e)}")
-        print("Error listing files: ", str(e))
+        # print("Error listing files: ", str(e))
         return jsonify({"error": str(e)}), 500
     
 
@@ -519,20 +521,33 @@ def get_logs():
         return jsonify({"error": "Internal server error"}), 500
 
 
-@app.route('/api/files/<file_id>/', methods=['DELETE'])
+# DELETE
+@app.route('/api/files/', methods=['DELETE'])
 @token_required
-def delete_file(current_user, file_id):
+def delete_file(current_user):
     try:
-        logger.debug(f"Attempting to delete file with ID: {file_id} for user: {current_user['email']}")
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Invalid JSON payload.'}), 400
+        s3_key = data.get('s3_key')
+        if not s3_key:
+            return jsonify({'error': 's3_key is required.'}), 400
+        
+        logger.debug(f"Attempting to delete file with s3 key: {s3_key} for user: {current_user['email']}")
 
 
         # Fetch the file document from MongoDB
-        file_doc = db.files.find_one({'id': file_id, 'user': str(current_user['_id'])})
+        file_doc = db.files.find_one({'s3_key': s3_key, 'user': str(current_user['_id'])})
 
         if not file_doc:
-            return jsonify({'error': 'File not found or unauthorized.'}), 404
+            logger.error(f"File not found or unauthorized for ID: {s3_key}")
+            # return jsonify({'error': 'File not found or unauthorized.'}), 404
 
-        s3_key = file_doc.get('s3_key')
+        logger.info(f"Deleting file with ID: {s3_key} for user: {current_user['email']} via S3")
+        if file_doc:
+            s3_key = file_doc.get('s3_key')
+        else:
+            s3_key = s3_key
 
         if not s3_key:
             return jsonify({'error': 'Invalid file metadata.'}), 400
@@ -555,22 +570,126 @@ def delete_file(current_user, file_id):
 
         # Delete the file metadata from MongoDB
         try:
-            result = db.files.delete_one({'id': file_id, 'user': str(current_user['_id'])})
+            result = db.files.delete_one({'s3_key': s3_key, 'user': str(current_user['_id'])})
             if result.deleted_count == 0:
-                logger.error(f"File metadata not found for ID: {file_id}")
-                return jsonify({'error': 'File metadata not found.'}), 404
-            logger.debug(f"Deleted file metadata from MongoDB for ID: {file_id}")
+                logger.error(f"File metadata not found for ID: {s3_key}")
+                return jsonify({'error': 'File metadata not found in db.'}), 200
+            logger.debug(f"Deleted file metadata from MongoDB for ID: {s3_key}")
         except Exception as e:
             logger.exception(f"Error deleting file metadata from MongoDB: {str(e)}")
-            return jsonify({'error': 'Failed to delete file metadata.'}), 500
+            return jsonify({'error': 'Failed to delete file metadata.'}), 200
 
         return jsonify({'message': 'File deleted successfully.'}), 200
 
     except Exception as e:
         logger.exception(f"Unexpected error during file deletion: {str(e)}")
+        print("Unexpected error during file deletion: ", str(e))
         return jsonify({'error': 'An unexpected error occurred.'}), 500
 
+@app.route('/api/files/rename/', methods=['POST'])
+@token_required
+def rename_file(current_user):
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Invalid JSON payload.'}), 400
 
+        s3_key = data.get('s3_key')
+        new_filename = data.get('new_filename')
+
+        if not s3_key or not new_filename:
+            return jsonify({'error': 's3_key and new_filename are required.'}), 400
+
+        logger.debug(f"User {current_user['email']} is attempting to rename file {s3_key} to {new_filename}")
+
+        # Fetch the file document from MongoDB
+        file_doc = db.files.find_one({'s3_key': s3_key, 'user': str(current_user['_id'])})
+
+        if not file_doc:
+            return jsonify({'error': 'File not found or unauthorized.'}), 404
+
+        # Extract current s3 key details
+        bucket_name = os.getenv('AWS_APP_STORAGE_BUCKET_NAME')
+        current_key = file_doc.get('s3_key')
+        if not current_key:
+            return jsonify({'error': 'Invalid file metadata.'}), 400
+
+        # Determine the new S3 key
+        # Assuming the new filename is in the same directory as the current key
+        # Adjust this logic if your keys include paths
+        new_key = '/'.join(current_key.split('/')[:-1] + [new_filename])
+
+        # Initialize S3 client
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_APP_S3_REGION_NAME')
+        )
+
+        # Check if the new key already exists to prevent overwriting
+        try:
+            s3.head_object(Bucket=bucket_name, Key=new_key)
+            return jsonify({'error': 'A file with the new filename already exists.'}), 409
+        except s3.exceptions.ClientError as e:
+            if e.response['Error']['Code'] != '404':
+                logger.exception(f"Error checking existence of new key: {str(e)}")
+                return jsonify({'error': 'Error checking file existence.'}), 500
+            # If 404, the object does not exist, which is desired
+
+        # Copy the object to the new key
+        copy_source = {
+            'Bucket': bucket_name,
+            'Key': current_key
+        }
+
+        try:
+            s3.copy_object(CopySource=copy_source, Bucket=bucket_name, Key=new_key)
+            logger.debug(f"Copied file from {current_key} to {new_key} in S3.")
+        except Exception as e:
+            logger.exception(f"Error copying file in S3: {str(e)}")
+            return jsonify({'error': 'Failed to copy file in storage.'}), 500
+
+        # Delete the original object from S3
+        try:
+            s3.delete_object(Bucket=bucket_name, Key=current_key)
+            logger.debug(f"Deleted original file from S3: {current_key}")
+        except Exception as e:
+            logger.exception(f"Error deleting original file from S3: {str(e)}")
+            # Optionally, you might want to delete the copied file to maintain consistency
+            try:
+                s3.delete_object(Bucket=bucket_name, Key=new_key)
+                logger.debug(f"Deleted copied file due to failure: {new_key}")
+            except Exception as delete_e:
+                logger.exception(f"Error deleting copied file after failure: {str(delete_e)}")
+            return jsonify({'error': 'Failed to delete original file from storage.'}), 500
+
+        # Update the MongoDB document with the new s3_key and filename
+        try:
+            update_result = db.files.update_one(
+                {'_id': file_doc['_id']},
+                {'$set': {'s3_key': new_key, 'filename': new_filename}}
+            )
+            if update_result.modified_count == 0:
+                logger.error(f"Failed to update MongoDB document for file ID: {file_doc['_id']}")
+                return jsonify({'error': 'Failed to update file metadata.'}), 500
+            logger.debug(f"Updated MongoDB document with new filename and s3_key for file ID: {file_doc['_id']}")
+        except Exception as e:
+            logger.exception(f"Error updating file metadata in MongoDB: {str(e)}")
+            # Optionally, attempt to revert S3 changes to maintain consistency
+            try:
+                s3.copy_object(CopySource=copy_source, Bucket=bucket_name, Key=current_key)
+                s3.delete_object(Bucket=bucket_name, Key=new_key)
+                logger.debug("Reverted S3 changes due to MongoDB update failure.")
+            except Exception as revert_e:
+                logger.exception(f"Error reverting S3 changes: {str(revert_e)}")
+            return jsonify({'error': 'Failed to update file metadata.'}), 500
+
+        return jsonify({'message': 'File renamed successfully.', 'new_s3_key': new_key, 'new_filename': new_filename}), 200
+
+    except Exception as e:
+        logger.exception(f"Unexpected error during file rename: {str(e)}")
+        return jsonify({'error': 'An unexpected error occurred.'}), 500
 
 if __name__ == '__main__':
     print("* Loading..." + "please wait until server has fully started")
