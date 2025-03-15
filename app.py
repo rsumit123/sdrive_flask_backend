@@ -14,6 +14,7 @@ import requests
 from utils import get_bucket_url
 from mongo_handler import MongoDBHandler
 import logging
+from list_files import list_files_v2
 
 # Load environment variables
 load_dotenv()
@@ -42,7 +43,7 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 mongo_handler.setFormatter(formatter)
 logger.addHandler(mongo_handler)
 
-MAX_FILE_SIZE = 1024 * 1024 * 400  # 400MB
+MAX_FILE_SIZE = 1024 * 1024 * 800  # 800MB
 
 # Handle the OPTIONS request manually to avoid 404 errors
 @app.before_request
@@ -128,61 +129,11 @@ def login():
         return jsonify({"error": "Invalid credentials"}), 401
 
 
-@app.route('/api/files/', methods=['GET'])
+@app.route('/api/v2/files/', methods=['GET'])
 @token_required
-def list_files(current_user):
-    try:
-    
-        logger.debug(f"Listing files for {current_user['email']}")
-        # Setup S3 client
-        logger.debug(f"Setting up S3 client")
-        # logger.debug(f"App Access key: {os.getenv('AWS_APP_ACCESS_KEY_ID')}")
-        s3 = boto3.client('s3',
-                        aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
-                        aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
-                        region_name=os.getenv('AWS_APP_S3_REGION_NAME'))
-        
-        prefix = current_user['email'].split('.com')[0].replace("@", "-")
+def list_files_pagination(current_user):
+    return list_files_v2(current_user)
 
-        # List objects in the S3 bucket with the user's prefix
-        response = s3.list_objects_v2(Bucket=os.getenv('AWS_APP_STORAGE_BUCKET_NAME'), Prefix=f"{prefix}/")
-        
-        files = []
-        for item in response.get('Contents', []):
-            if 'Key' not in item:
-                continue
-            # print(item)
-            file_key = item['Key']
-            file_record = db.files.find_one({"s3_key": file_key, "upload_complete": "complete"})
-            
-            files.append({
-            'file_name': file_key.split("/")[-1],
-            'simple_url': get_bucket_url() + file_key,
-            'metadata': {"tier": item['StorageClass'].lower(), "size": item['Size']},
-            'upload_complete': 'complete',
-            "last_modified": item['LastModified'],
-            'id': file_key,
-            "s3_key": file_key
-            })
-            # else:
-            #     files.append({
-            #         'file_name': file_key.split("/")[-1],
-            #         'simple_url': get_bucket_url() + file_key,
-            #         'metadata': {"tier": item['StorageClass'].lower(), "size": item['Size']},
-            #         'upload_complete': file_record['upload_complete'],
-            #         'id': 'complete',
-            #         "last_modified": item['LastModified'],
-            #         "s3_key": file_key
-            #     })
-        files = sorted(files, key=lambda x: x['last_modified'], reverse=True)
-            
-        
-        return jsonify(files), 200
-    except Exception as e:
-        logger.exception(f"Error listing files: {str(e)}")
-        # print("Error listing files: ", str(e))
-        return jsonify({"error": str(e)}), 500
-    
 
 @app.route('/api/files/<file_id>/download_file/', methods=['GET'])
 @token_required
