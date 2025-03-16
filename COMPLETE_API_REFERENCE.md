@@ -112,6 +112,19 @@ This endpoint offers several performance advantages over the v2 endpoint:
 2. **Response Caching**: Caches entire responses for 5 minutes
 3. **Efficient Pagination**: Uses S3's native pagination mechanisms
 4. **Automatic Cache Expiration**: Cache entries automatically expire after 1 hour
+5. **Recently Uploaded Files**: Includes recently uploaded files that might not yet appear in S3 listings due to S3's eventual consistency model
+
+#### Handling of Recently Uploaded Files
+
+Due to S3's eventual consistency model, newly uploaded files might not immediately appear in the `list_objects_v2` API results. To address this issue, the endpoint also checks the database for recently uploaded files (within the last 5 minutes) and includes them in the response. This ensures that files are visible in the listing immediately after upload confirmation, even if they haven't propagated through S3's consistency model yet.
+
+When `use_cache=false` is specified, the endpoint will:
+1. Fetch the latest file list from S3
+2. Check the database for recently uploaded files
+3. Combine and sort the results
+4. Skip caching the response if recently uploaded files are included
+
+This approach provides the best balance between performance and data freshness.
 
 ### 3. Upload Files
 

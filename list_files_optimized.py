@@ -86,35 +86,55 @@ def list_files_optimized(current_user, db):
                     # The last key will be our start_after for the next page
                     start_after = all_keys_response['Contents'][-1]['Key']
                 else:
-                    # Not enough objects to reach the requested page
-                    return jsonify({
-                        "files": [],
-                        "total": 0,
-                        "total_pages": 0,
-                        "page": page,
-                        "per_page": per_page,
-                        "next_cursor": None
-                    }), 200
+                    # Check if there are any files in the database that might not be in S3 yet
+                    db_count = db.files.count_documents({
+                        "user": str(current_user['_id']),
+                        "upload_complete": "complete",
+                        "s3_key": {"$regex": f"^{prefix}"}
+                    })
+                    
+                    if db_count == 0:
+                        # No files in database either
+                        return jsonify({
+                            "files": [],
+                            "total": 0,
+                            "total_pages": 0,
+                            "page": page,
+                            "per_page": per_page,
+                            "next_cursor": None
+                        }), 200
             except Exception as e:
                 logger.exception(f"Error calculating pagination offset: {str(e)}")
                 return jsonify({"error": str(e)}), 500
 
-        # Get the total count (this is a separate API call but necessary for pagination info)
+        # Get the total count from S3
         try:
             total_count_response = s3.list_objects_v2(
                 Bucket=bucket_name,
                 Prefix=prefix
             )
-            total_files = total_count_response.get('KeyCount', 0)
-            logger.debug(f"Total files in S3 for user: {total_files}")
+            s3_total_files = total_count_response.get('KeyCount', 0)
+            logger.debug(f"Total files in S3 for user: {s3_total_files}")
         except Exception as e:
-            logger.exception(f"Error getting total file count: {str(e)}")
-            total_files = 0  # Default if we can't get the count
+            logger.exception(f"Error getting total file count from S3: {str(e)}")
+            s3_total_files = 0  # Default if we can't get the count
+            
+        # Also get the total count from the database to account for recently uploaded files
+        db_total_files = db.files.count_documents({
+            "user": str(current_user['_id']),
+            "upload_complete": "complete",
+            "s3_key": {"$regex": f"^{prefix}"}
+        })
+        logger.debug(f"Total files in DB for user: {db_total_files}")
+        
+        # Use the higher count to ensure we don't miss any files
+        total_files = max(s3_total_files, db_total_files)
 
         # Calculate total pages
         total_pages = (total_files + per_page - 1) // per_page if total_files > 0 else 0
 
-        # Get the files for the current page
+        # Get the files for the current page from S3
+        s3_files = []
         try:
             # Use start_after for pagination if we have it
             if start_after:
@@ -132,7 +152,6 @@ def list_files_optimized(current_user, db):
                 )
             
             # Process the response
-            files = []
             if 'Contents' in response:
                 for obj in response['Contents']:
                     # Check if we have this file in MongoDB for additional metadata
@@ -161,43 +180,121 @@ def list_files_optimized(current_user, db):
                             if key not in file_obj['metadata']:
                                 file_obj['metadata'][key] = value
                     
-                    files.append(file_obj)
+                    s3_files.append(file_obj)
             
             # Determine the next cursor for cursor-based pagination
             next_cursor = None
-            if files and response.get('IsTruncated', False):
+            if s3_files and response.get('IsTruncated', False):
                 next_cursor = response.get('NextContinuationToken')
-            
-            # Build the response
-            response_payload = {
-                "files": files,
-                "total": total_files,
-                "total_pages": total_pages,
-                "page": page,
-                "per_page": per_page,
-                "next_cursor": next_cursor
-            }
-            
-            # Cache the response
-            if use_cache:
-                db.cache.update_one(
-                    {"key": cache_key},
-                    {"$set": {
-                        "key": cache_key,
-                        "data": response_payload,
-                        "timestamp": datetime.datetime.utcnow()
-                    }},
-                    upsert=True
-                )
-            
-            end_time = datetime.datetime.now()
-            logger.debug(f"File listing completed in {(end_time - start_time).total_seconds()} seconds")
-            
-            return jsonify(response_payload), 200
-            
+                
         except Exception as e:
-            logger.exception(f"Error listing files: {str(e)}")
+            logger.exception(f"Error listing files from S3: {str(e)}")
             return jsonify({"error": str(e)}), 500
+            
+        # Get recently uploaded files from the database that might not be in S3 yet
+        # Only do this if we're on the first page or if we're not using cursor pagination
+        recently_uploaded_files = []
+        if page == 1 or not use_cursor_pagination:
+            try:
+                # Calculate the time threshold for recent uploads (e.g., last 5 minutes)
+                recent_time = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
+                
+                # Find recently uploaded files in the database
+                recent_files_cursor = db.files.find({
+                    "user": str(current_user['_id']),
+                    "upload_complete": "complete",
+                    "s3_key": {"$regex": f"^{prefix}"},
+                    # Either created recently or has no last_modified field
+                    "$or": [
+                        {"created_at": {"$gte": recent_time}},
+                        {"last_modified": {"$exists": False}}
+                    ]
+                }).sort("created_at", -1).limit(per_page)
+                
+                for file_record in recent_files_cursor:
+                    s3_key = file_record.get('s3_key')
+                    
+                    # Skip if this file is already in our S3 files list
+                    if any(f['s3_key'] == s3_key for f in s3_files):
+                        continue
+                    
+                    # Try to get metadata from S3
+                    try:
+                        s3_object = s3.head_object(Bucket=bucket_name, Key=s3_key)
+                        
+                        file_obj = {
+                            'file_name': s3_key.split("/")[-1],
+                            'simple_url': get_bucket_url() + s3_key,
+                            'metadata': {
+                                "tier": s3_object.get('StorageClass', 'standard').lower(),
+                                "size": s3_object.get('ContentLength', 0),
+                                "content_type": s3_object.get('ContentType', 'application/octet-stream')
+                            },
+                            'upload_complete': 'complete',
+                            "last_modified": s3_object.get('LastModified').isoformat(),
+                            'id': s3_key.replace("/", "-"),
+                            "s3_key": s3_key,
+                            "exists_in_db": True
+                        }
+                    except Exception as e:
+                        # If we can't get S3 metadata, use what we have in the database
+                        logger.warning(f"Could not get S3 metadata for {s3_key}: {str(e)}")
+                        
+                        file_obj = {
+                            'file_name': s3_key.split("/")[-1],
+                            'simple_url': get_bucket_url() + s3_key,
+                            'metadata': file_record.get('metadata', {
+                                "tier": "standard",
+                                "size": 0
+                            }),
+                            'upload_complete': 'complete',
+                            "last_modified": file_record.get('created_at', datetime.datetime.utcnow()).isoformat(),
+                            'id': s3_key.replace("/", "-"),
+                            "s3_key": s3_key,
+                            "exists_in_db": True,
+                            "recently_uploaded": True
+                        }
+                    
+                    recently_uploaded_files.append(file_obj)
+                    
+            except Exception as e:
+                logger.exception(f"Error getting recently uploaded files from database: {str(e)}")
+                # Continue with what we have from S3
+        
+        # Combine and sort the files
+        all_files = s3_files + recently_uploaded_files
+        all_files.sort(key=lambda x: x.get('last_modified', ''), reverse=True)
+        
+        # Limit to per_page
+        files = all_files[:per_page]
+            
+        # Build the response
+        response_payload = {
+            "files": files,
+            "total": total_files,
+            "total_pages": total_pages,
+            "page": page,
+            "per_page": per_page,
+            "next_cursor": next_cursor
+        }
+        
+        # Cache the response only if we're not including recently uploaded files
+        # or if we're explicitly told to use the cache
+        if use_cache and not recently_uploaded_files:
+            db.cache.update_one(
+                {"key": cache_key},
+                {"$set": {
+                    "key": cache_key,
+                    "data": response_payload,
+                    "timestamp": datetime.datetime.utcnow()
+                }},
+                upsert=True
+            )
+        
+        end_time = datetime.datetime.now()
+        logger.debug(f"File listing completed in {(end_time - start_time).total_seconds()} seconds")
+        
+        return jsonify(response_payload), 200
             
     except Exception as e:
         logger.exception(f"Error in list_files_optimized: {str(e)}")

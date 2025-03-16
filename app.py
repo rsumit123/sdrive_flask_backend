@@ -733,7 +733,8 @@ def store_file_metadata(current_user, filename, s3_key, content_type, tier, uplo
             'tier': tier
         },
         'upload_complete': 'complete' if upload_complete else 'pending',
-        "id": s3_key.replace("/", "-")
+        "id": s3_key.replace("/", "-"),
+        "created_at": datetime.datetime.utcnow()
         # Add other necessary fields as required
     }
 
@@ -769,9 +770,13 @@ def confirm_uploads(current_user):
     results = []
     for s3_key in s3_keys:
         try:
+            current_time = datetime.datetime.utcnow()
             result = db.files.update_one(
                 {'s3_key': s3_key, 'user': str(current_user['_id'])},
-                {'$set': {'upload_complete': 'complete'}}
+                {'$set': {
+                    'upload_complete': 'complete',
+                    'last_modified': current_time
+                }}
             )
             
             if result.matched_count == 0:
@@ -797,9 +802,13 @@ def confirm_upload(current_user):
         return jsonify({'error': 's3_key is required'}), 400
 
     # Update the file metadata to mark upload as complete
+    current_time = datetime.datetime.utcnow()
     result = db.files.update_one(
         {'s3_key': s3_key, 'user': str(current_user['_id'])},
-        {'$set': {'upload_complete': 'complete'}}
+        {'$set': {
+            'upload_complete': 'complete',
+            'last_modified': current_time
+        }}
     )
 
     if result.matched_count == 0:
