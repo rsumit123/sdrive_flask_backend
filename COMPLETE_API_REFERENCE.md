@@ -59,7 +59,9 @@ GET /api/v2/files/
 
 ### 2. List Files - Optimized (v3)
 
-A high-performance version of the list files endpoint that significantly reduces response time, especially for large file collections.
+Lists files using standard page-based pagination. Queries the database for the file list and then fetches metadata from S3 for each file on the current page.
+
+*Note: While simpler, this approach might be slower than cursor-based pagination for very large datasets due to multiple S3 API calls per page.*
 
 #### Request
 
@@ -71,10 +73,9 @@ GET /api/v3/files/
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `page` | Integer | No | 1 | Page number for offset-based pagination |
-| `per_page` | Integer | No | 50 | Number of items per page (max 1000) |
-| `cursor` | String | No | null | Cursor for cursor-based pagination (overrides page parameter) |
-| `use_cache` | Boolean | No | true | Whether to use cached results |
+| `page` | Integer | No | 1 | Page number to retrieve (starts at 1) |
+| `per_page` | Integer | No | 50 | Number of items per page (max 100 recommended) |
+
 
 #### Response
 
@@ -82,49 +83,48 @@ GET /api/v3/files/
 {
   "files": [
     {
-      "file_name": "example.jpg",
-      "simple_url": "https://bucket-url.com/username/example.jpg",
+      "file_name": "report_final.pdf",
+      "simple_url": "https://bucket-url.com/username/report_final.pdf",
       "metadata": {
         "tier": "standard",
-        "size": 1024000,
-        "content_type": "image/jpeg"
+        "size": 512000,
+        "content_type": "application/pdf"
       },
       "upload_complete": "complete",
-      "last_modified": "2023-05-15T14:30:45.123Z",
-      "id": "username-example.jpg",
-      "s3_key": "username/example.jpg",
+      "last_modified": "2023-06-15T11:05:00.000Z",
+      "id": "username-report_final.pdf",
+      "s3_key": "username/report_final.pdf",
       "exists_in_db": true
     }
+    // ... more files
   ],
-  "total": 120,
-  "total_pages": 3,
+  "total": 78,
+  "total_pages": 2,
   "page": 1,
-  "per_page": 50,
-  "next_cursor": "eyJrZXkiOiJ1c2VybmFtZS9leGFtcGxlLmpwZyJ9"
+  "per_page": 50
 }
 ```
 
-#### Performance Improvements
+#### Response Fields Explanation
 
-This endpoint offers several performance advantages over the v2 endpoint:
+-   `files`: An array containing the file objects for the current page, sorted by `last_modified` date (descending, based on database sort).
+-   `total`: The total number of files available for the user.
+-   `total_pages`: The total number of pages available based on `per_page`.
+-   `page`: The current page number being returned.
+-   `per_page`: The number of items requested per page.
 
-1. **Reduced API Calls**: Uses S3's `list_objects_v2` API to get multiple files in a single call
-2. **Response Caching**: Caches entire responses for 5 minutes
-3. **Efficient Pagination**: Uses S3's native pagination mechanisms
-4. **Automatic Cache Expiration**: Cache entries automatically expire after 1 hour
-5. **Recently Uploaded Files**: Includes recently uploaded files that might not yet appear in S3 listings due to S3's eventual consistency model
+#### Implementation Details
 
-#### Handling of Recently Uploaded Files
+1.  **Database Query**: Uses database `skip`/`limit` for pagination.
+2.  **Sorting**: Files are sorted by `last_modified` date (descending) in the database.
+3.  **S3 Metadata Fetch**: Makes individual `head_object` calls to S3 for files on the current page.
+4.  **No Caching/Cursors**: Does not use application-level caching or S3 cursors.
 
-Due to S3's eventual consistency model, newly uploaded files might not immediately appear in the `list_objects_v2` API results. To address this issue, the endpoint also checks the database for recently uploaded files (within the last 5 minutes) and includes them in the response. This ensures that files are visible in the listing immediately after upload confirmation, even if they haven't propagated through S3's consistency model yet.
+#### Important Considerations
 
-When `use_cache=false` is specified, the endpoint will:
-1. Fetch the latest file list from S3
-2. Check the database for recently uploaded files
-3. Combine and sort the results
-4. Skip caching the response if recently uploaded files are included
-
-This approach provides the best balance between performance and data freshness.
+-   **Performance**: Can be slow if `per_page` is high. Recommend keeping `per_page` <= 50.
+-   **S3 Eventual Consistency**: File list is from DB (consistent), but S3 metadata (size/tier) might have slight delays if files are modified externally.
+-   **DB vs S3 Discrepancies**: Files in DB but not S3 are logged and omitted from the response.
 
 ### 3. Upload Files
 
