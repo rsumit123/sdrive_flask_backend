@@ -762,4 +762,235 @@ await fetchFileDetails('example.jpg');
 await fetchFileDetails('username-example.jpg');
 await fetchFileDetails('username/example.jpg');
 await fetchFileDetails('507f1f77bcf86cd799439011'); // MongoDB ObjectId
-``` 
+```
+
+## Check Account Usage Endpoint
+
+Retrieves account usage statistics for the authenticated user, including total file count, total storage size, and breakdown by storage tier.
+
+### Endpoint
+
+```
+GET /api/account/check_account_usage/
+```
+
+### Authentication
+
+This endpoint requires authentication. Include the JWT token in the Authorization header:
+
+```
+Authorization: Bearer <your_jwt_token>
+```
+
+Or using the `x-access-token` header:
+
+```
+x-access-token: <your_jwt_token>
+```
+
+### Request Parameters
+
+This endpoint does not require any query parameters.
+
+### Response Format
+
+```json
+{
+  "total_files": 150,
+  "total_file_size": 5242880000,
+  "total_file_size_mb": 5000.0,
+  "total_file_size_gb": 4.88,
+  "files_in_standard": 120,
+  "files_in_archive": 30
+}
+```
+
+#### Response Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_files` | Integer | Total number of files uploaded by the user |
+| `total_file_size` | Integer | Total size of all uploaded files in bytes |
+| `total_file_size_mb` | Float | Total file size in megabytes (MB), rounded to 2 decimal places |
+| `total_file_size_gb` | Float | Total file size in gigabytes (GB), rounded to 2 decimal places |
+| `files_in_standard` | Integer | Number of files stored in standard storage tier |
+| `files_in_archive` | Integer | Number of files stored in archive/glacier storage tier |
+
+### Storage Tier Classification
+
+- **Standard**: Files stored with `STANDARD` storage class in S3
+- **Archive**: Files stored with `GLACIER` or `DEEP_ARCHIVE` storage class in S3
+
+### Examples
+
+#### Example 1: Basic Request
+
+Request:
+```javascript
+const response = await fetch('/api/account/check_account_usage/', {
+  method: 'GET',
+  headers: {
+    'Authorization': `Bearer ${token}`,
+    'Content-Type': 'application/json'
+  }
+});
+
+const usage = await response.json();
+console.log(`Total files: ${usage.total_files}`);
+console.log(`Total storage: ${usage.total_file_size_gb} GB`);
+console.log(`Standard files: ${usage.files_in_standard}`);
+console.log(`Archive files: ${usage.files_in_archive}`);
+```
+
+Response:
+```json
+{
+  "total_files": 150,
+  "total_file_size": 5242880000,
+  "total_file_size_mb": 5000.0,
+  "total_file_size_gb": 4.88,
+  "files_in_standard": 120,
+  "files_in_archive": 30
+}
+```
+
+#### Example 2: Using Axios
+
+```javascript
+import axios from 'axios';
+
+const getAccountUsage = async () => {
+  try {
+    const response = await axios.get('/api/account/check_account_usage/', {
+      headers: {
+        'Authorization': `Bearer ${localStorage.getItem('token')}`
+      }
+    });
+    
+    const usage = response.data;
+    
+    // Display usage in UI
+    document.getElementById('total-files').textContent = usage.total_files;
+    document.getElementById('total-size').textContent = `${usage.total_file_size_gb} GB`;
+    document.getElementById('standard-files').textContent = usage.files_in_standard;
+    document.getElementById('archive-files').textContent = usage.files_in_archive;
+    
+    return usage;
+  } catch (error) {
+    console.error('Error fetching account usage:', error);
+    throw error;
+  }
+};
+
+// Call the function
+getAccountUsage();
+```
+
+#### Example 3: React Hook
+
+```javascript
+import { useState, useEffect } from 'react';
+import axios from 'axios';
+
+const useAccountUsage = () => {
+  const [usage, setUsage] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const fetchUsage = async () => {
+      try {
+        setLoading(true);
+        const response = await axios.get('/api/account/check_account_usage/', {
+          headers: {
+            'Authorization': `Bearer ${localStorage.getItem('token')}`
+          }
+        });
+        setUsage(response.data);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchUsage();
+  }, []);
+
+  return { usage, loading, error };
+};
+
+// Usage in component
+const AccountUsageDisplay = () => {
+  const { usage, loading, error } = useAccountUsage();
+
+  if (loading) return <div>Loading usage statistics...</div>;
+  if (error) return <div>Error: {error}</div>;
+  if (!usage) return null;
+
+  return (
+    <div className="usage-stats">
+      <h2>Account Usage</h2>
+      <div>
+        <p>Total Files: {usage.total_files}</p>
+        <p>Total Storage: {usage.total_file_size_gb} GB ({usage.total_file_size_mb} MB)</p>
+        <p>Standard Tier: {usage.files_in_standard} files</p>
+        <p>Archive Tier: {usage.files_in_archive} files</p>
+      </div>
+    </div>
+  );
+};
+```
+
+### Implementation Details
+
+1. **Data Sources**: The endpoint aggregates data from MongoDB and S3:
+   - First checks MongoDB for cached file metadata (size and tier)
+   - Falls back to fetching from S3 if metadata is missing
+   - Uses parallel S3 API calls for efficiency when fetching missing data
+
+2. **Performance Considerations**:
+   - For users with many files, the endpoint may make multiple S3 API calls
+   - The endpoint uses parallel processing to minimize latency
+   - Consider caching the response on the frontend to reduce API calls
+
+3. **Accuracy**:
+   - File counts are based on MongoDB records with `upload_complete: "complete"`
+   - File sizes are retrieved from S3 or cached metadata
+   - Tier classification is based on S3 storage class
+
+### Error Responses
+
+#### 401 Unauthorized
+```json
+{
+  "error": "Token is missing!"
+}
+```
+
+#### 403 Forbidden
+```json
+{
+  "error": "Invalid token!"
+}
+```
+
+#### 500 Internal Server Error
+```json
+{
+  "error": "Failed to retrieve account usage statistics"
+}
+```
+
+### Best Practices
+
+1. **Caching**: Cache the response on the frontend and refresh periodically (e.g., every 5-10 minutes)
+2. **Error Handling**: Always handle errors gracefully and provide user feedback
+3. **Loading States**: Show loading indicators while fetching usage statistics
+4. **Refresh**: Provide a manual refresh button for users to update their usage stats on demand
+
+### Integration Notes
+
+- This endpoint is designed to be called periodically to display account usage in the UI
+- The response includes both raw bytes and human-readable MB/GB values for convenience
+- The tier breakdown helps users understand their storage distribution between standard and archive storage 

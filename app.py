@@ -5,6 +5,7 @@ import bcrypt
 import jwt
 import datetime
 import os
+import secrets
 from dotenv import load_dotenv
 from auth import token_required
 import boto3
@@ -20,6 +21,7 @@ import concurrent.futures
 from functools import partial
 from file_details import get_file_details
 from list_files_optimized import list_files_optimized
+from email_service import send_verification_email
 
 # Load environment variables
 load_dotenv()
@@ -84,32 +86,86 @@ def register():
         return jsonify({"error": "Missing email or password"}), 400
 
     # Check if user with the same email already exists
-    if db.users.find_one({"email": email}):
-        return jsonify({"error": "Email already registered"}), 409
+    existing_user = db.users.find_one({"email": email})
+    if existing_user:
+        # If user exists but email is not verified, allow re-registration
+        if existing_user.get('email_verified', False):
+            return jsonify({"error": "Email already registered"}), 409
+        else:
+            # Delete unverified user to allow re-registration
+            db.users.delete_one({"email": email})
 
     # Hash the password
     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-    # Insert new user into the database
+    # Generate verification token
+    verification_token = secrets.token_urlsafe(32)
+
+    # Insert new user into the database with email_verified set to False
     db.users.insert_one({
         "email": email,
-        "password": hashed_password
+        "password": hashed_password,
+        "email_verified": False,
+        "verification_token": verification_token,
+        "verification_token_expiry": datetime.datetime.utcnow() + datetime.timedelta(hours=24),
+        "created_at": datetime.datetime.utcnow()
     })
 
-    # Generate JWT token
-    token = jwt.encode({
-        'email': email,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
-    }, app.config['SECRET_KEY'], algorithm='HS256')
+    # Send verification email
+    email_sent = send_verification_email(email, verification_token)
+    if not email_sent:
+        logger.warning(f"Failed to send verification email to {email}, but user was created")
 
-    # Return success message along with the token
-    return jsonify({"message": "User created successfully", "token": token}), 201
+    # Return success message without token - user needs to verify email first
+    return jsonify({
+        "message": "User created successfully. Please check your email to verify your account.",
+        "email_sent": email_sent
+    }), 201
 
 
 # Health check route
 @app.route('/api/health/', methods=['GET'])
 def health_check():
     return jsonify({"message": "Server is running"}), 200
+
+@app.route('/api/auth/verify-email/', methods=['POST', 'OPTIONS'])
+def verify_email():
+    if request.method == 'OPTIONS':
+        # Allow the preflight OPTIONS request
+        return '', 200
+    
+    # Get verification token from the request body
+    token = request.json.get('token')
+    
+    if not token:
+        return jsonify({"error": "Verification token is required"}), 400
+    
+    # Find user with this verification token
+    user = db.users.find_one({"verification_token": token})
+    
+    if not user:
+        return jsonify({"error": "Invalid verification token"}), 400
+    
+    # Check if token has expired
+    if 'verification_token_expiry' in user:
+        if datetime.datetime.utcnow() > user['verification_token_expiry']:
+            return jsonify({"error": "Verification token has expired"}), 400
+    
+    # Check if email is already verified
+    if user.get('email_verified', False):
+        return jsonify({"message": "Email is already verified"}), 200
+    
+    # Mark email as verified and remove verification token
+    db.users.update_one(
+        {"_id": user['_id']},
+        {
+            "$set": {"email_verified": True},
+            "$unset": {"verification_token": "", "verification_token_expiry": ""}
+        }
+    )
+    
+    return jsonify({"message": "Email verified successfully"}), 200
+
 
 @app.route('/api/auth/login/', methods=['POST', 'OPTIONS'])
 def login():
@@ -135,6 +191,13 @@ def login():
 
     # Check if user exists and if the password matches
     if user and bcrypt.checkpw(password.encode('utf-8'), user['password']):
+        # Check if email is verified
+        if not user.get('email_verified', False):
+            return jsonify({
+                "error": "Email not verified. Please check your email and verify your account.",
+                "email_verified": False
+            }), 403
+        
         # Generate a token
         token = jwt.encode({
             'email': email,
@@ -1313,6 +1376,146 @@ def file_details(current_user, file_identifier):
     If the file is not found in S3, a 404 error is returned.
     """
     return get_file_details(current_user, file_identifier)
+
+@app.route('/api/account/check_account_usage/', methods=['GET'])
+@token_required
+def check_account_usage(current_user):
+    """
+    Get account usage statistics for the authenticated user.
+    
+    Returns:
+    - total_files: Total number of files uploaded
+    - total_file_size: Total size of all uploaded files in bytes
+    - files_in_standard: Number of files stored in standard tier
+    - files_in_archive: Number of files stored in archive/glacier tier
+    
+    This endpoint aggregates data from MongoDB and S3 to provide accurate usage statistics.
+    """
+    try:
+        logger.debug(f"Checking account usage for {current_user['email']}")
+        
+        # Generate username prefix from email
+        username_prefix = current_user['email'].split('.com')[0].replace("@", "-")
+        
+        # Query MongoDB for all complete files for this user
+        query = {
+            "user": str(current_user['_id']),
+            "upload_complete": "complete",
+            "s3_key": {"$regex": f"^{username_prefix}/"}
+        }
+        
+        # Get all file records
+        file_records = list(db.files.find(query, {
+            "_id": 1,
+            "s3_key": 1,
+            "metadata": 1,
+            "cached_metadata": 1
+        }))
+        
+        # Initialize counters
+        total_files = len(file_records)
+        total_file_size = 0
+        files_in_standard = 0
+        files_in_archive = 0
+        
+        # Initialize S3 client for fetching sizes if needed
+        s3 = None
+        bucket_name = os.getenv('AWS_APP_STORAGE_BUCKET_NAME')
+        missing_info_files = []  # Files that need S3 lookup for size or tier
+        
+        # Process each file record
+        for record in file_records:
+            file_size = 0
+            tier = None
+            
+            # Try to get size and tier from cached_metadata first (most reliable)
+            if 'cached_metadata' in record and record['cached_metadata']:
+                cached = record['cached_metadata']
+                if 'metadata' in cached:
+                    file_size = cached['metadata'].get('size', 0)
+                    tier = cached['metadata'].get('tier', '').lower()
+            
+            # Fallback to metadata if cached_metadata not available
+            if file_size == 0 and 'metadata' in record and record['metadata']:
+                file_size = record['metadata'].get('size', 0)
+                if not tier:
+                    tier = record['metadata'].get('tier', '').lower()
+            
+            # If size or tier is still missing, we'll need to fetch from S3
+            if file_size == 0 or not tier:
+                missing_info_files.append(record)
+                continue  # Skip counting tier for now, we'll do it after S3 lookup
+            
+            # Classify tier for counting
+            # Archive includes: glacier, GLACIER, DEEP_ARCHIVE, deep_archive
+            if tier and (tier in ['glacier', 'deep_archive'] or (isinstance(tier, str) and tier.upper() in ['GLACIER', 'DEEP_ARCHIVE'])):
+                files_in_archive += 1
+            else:
+                # Default to standard if tier is not archive
+                files_in_standard += 1
+            
+            total_file_size += file_size
+        
+        # Fetch missing sizes and tiers from S3 if needed
+        if missing_info_files:
+            if s3 is None:
+                s3 = boto3.client(
+                    's3',
+                    aws_access_key_id=os.getenv('AWS_APP_ACCESS_KEY_ID'),
+                    aws_secret_access_key=os.getenv('AWS_APP_SECRET_ACCESS_KEY'),
+                    region_name=os.getenv('AWS_APP_S3_REGION_NAME')
+                )
+            
+            # Fetch sizes and tiers in parallel for missing files
+            def get_s3_info(record):
+                try:
+                    s3_key = record.get('s3_key')
+                    if not s3_key:
+                        return (0, 'standard')
+                    
+                    head_response = s3.head_object(Bucket=bucket_name, Key=s3_key)
+                    size = head_response.get('ContentLength', 0)
+                    storage_class = head_response.get('StorageClass', 'STANDARD')
+                    
+                    # Determine tier from storage class
+                    if storage_class in ['GLACIER', 'DEEP_ARCHIVE']:
+                        tier = 'glacier'
+                    else:
+                        tier = 'standard'
+                    
+                    return (size, tier)
+                except Exception as e:
+                    logger.warning(f"Error fetching info for {record.get('s3_key')}: {str(e)}")
+                    return (0, 'standard')
+            
+            # Fetch info in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                s3_info = list(executor.map(get_s3_info, missing_info_files))
+            
+            # Add the fetched sizes and count tiers
+            for size, tier in s3_info:
+                total_file_size += size
+                if tier in ['glacier', 'deep_archive']:
+                    files_in_archive += 1
+                else:
+                    files_in_standard += 1
+        
+        # Prepare response
+        response = {
+            "total_files": total_files,
+            "total_file_size": total_file_size,
+            "total_file_size_mb": round(total_file_size / (1024 * 1024), 2),
+            "total_file_size_gb": round(total_file_size / (1024 * 1024 * 1024), 2),
+            "files_in_standard": files_in_standard,
+            "files_in_archive": files_in_archive
+        }
+        
+        logger.debug(f"Account usage for {current_user['email']}: {response}")
+        return jsonify(response), 200
+        
+    except Exception as e:
+        logger.exception(f"Error checking account usage: {str(e)}")
+        return jsonify({'error': 'Failed to retrieve account usage statistics'}), 500
 
 if __name__ == '__main__':
     print("* Loading..." + "please wait until server has fully started")
