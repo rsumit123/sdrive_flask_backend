@@ -192,7 +192,10 @@ def login():
     # Check if user exists and if the password matches
     if user and bcrypt.checkpw(password.encode('utf-8'), user['password']):
         # Check if email is verified
-        if not user.get('email_verified', False):
+        # For backward compatibility: if email_verified field doesn't exist, treat as verified (existing users)
+        # Only require verification for new users who explicitly have email_verified: False
+        email_verified = user.get('email_verified')
+        if email_verified is False:  # Explicitly False (not None/missing)
             return jsonify({
                 "error": "Email not verified. Please check your email and verify your account.",
                 "email_verified": False
