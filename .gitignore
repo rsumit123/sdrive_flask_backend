@@ -1,11 +1,53 @@
-.idea/
-.vscode/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
 .venv*/
 venv*/
-__pycache__/
-dist/
+env/
+ENV/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+.env.recovered
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing & Coverage
 .coverage*
 htmlcov/
 .tox/
+.pytest_cache/
+.hypothesis/
+
+# Documentation
 docs/_build/
-.env
+
+# Lambda Package (downloaded from AWS)
+lambda_package/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Zappa
+.zappa/

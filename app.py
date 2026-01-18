@@ -64,6 +64,32 @@ mongo_handler.setFormatter(formatter)
 logger.addHandler(mongo_handler)
 
 MAX_FILE_SIZE = 1024 * 1024 * 800  # 800MB
+MAX_ACCOUNT_STORAGE = 1024 * 1024 * 1024 * 10  # 10GB per account
+
+def get_account_storage_used(user_id, username_prefix):
+    """Calculate total storage used by an account."""
+    query = {
+        "user": str(user_id),
+        "upload_complete": "complete",
+        "s3_key": {"$regex": f"^{username_prefix}/"}
+    }
+
+    file_records = list(db.files.find(query, {"metadata": 1, "cached_metadata": 1}))
+
+    total_size = 0
+    for record in file_records:
+        file_size = 0
+        # Try cached_metadata first
+        if 'cached_metadata' in record and record['cached_metadata']:
+            cached = record['cached_metadata']
+            if 'metadata' in cached:
+                file_size = cached['metadata'].get('size', 0)
+        # Fallback to metadata
+        if file_size == 0 and 'metadata' in record and record['metadata']:
+            file_size = record['metadata'].get('size', 0)
+        total_size += file_size
+
+    return total_size
 
 # Handle the OPTIONS request manually to avoid 404 errors
 @app.before_request
@@ -706,6 +732,25 @@ def upload_file(current_user):
         # Generate username from email
         email_parts = current_user['email'].split('@')
         username = f"{email_parts[0]}-{email_parts[1].split('.')[0]}"
+
+        # Check account storage limit before processing uploads
+        current_storage = get_account_storage_used(current_user['_id'], username)
+        total_upload_size = sum(f.get('file_size', 0) for f in files_data)
+
+        if current_storage + total_upload_size > MAX_ACCOUNT_STORAGE:
+            remaining_space = MAX_ACCOUNT_STORAGE - current_storage
+            return jsonify({
+                'error': 'Account storage limit exceeded',
+                'message': f'Your account has {remaining_space / (1024*1024*1024):.2f} GB remaining. '
+                           f'You are trying to upload {total_upload_size / (1024*1024*1024):.2f} GB. '
+                           f'Please delete some files or reduce the upload size.',
+                'current_storage_bytes': current_storage,
+                'current_storage_gb': round(current_storage / (1024*1024*1024), 2),
+                'max_storage_bytes': MAX_ACCOUNT_STORAGE,
+                'max_storage_gb': round(MAX_ACCOUNT_STORAGE / (1024*1024*1024), 2),
+                'remaining_bytes': remaining_space,
+                'remaining_gb': round(remaining_space / (1024*1024*1024), 2)
+            }), 400
 
         # Process each file in parallel
         results = []
@@ -1504,13 +1549,18 @@ def check_account_usage(current_user):
                     files_in_standard += 1
         
         # Prepare response
+        remaining_storage = MAX_ACCOUNT_STORAGE - total_file_size
         response = {
             "total_files": total_files,
             "total_file_size": total_file_size,
             "total_file_size_mb": round(total_file_size / (1024 * 1024), 2),
             "total_file_size_gb": round(total_file_size / (1024 * 1024 * 1024), 2),
             "files_in_standard": files_in_standard,
-            "files_in_archive": files_in_archive
+            "files_in_archive": files_in_archive,
+            "storage_limit": MAX_ACCOUNT_STORAGE,
+            "storage_limit_gb": round(MAX_ACCOUNT_STORAGE / (1024 * 1024 * 1024), 2),
+            "remaining_storage": remaining_storage,
+            "remaining_storage_gb": round(remaining_storage / (1024 * 1024 * 1024), 2)
         }
         
         logger.debug(f"Account usage for {current_user['email']}: {response}")
